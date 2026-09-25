@@ -13,6 +13,10 @@
 - 展开：按折叠顺序逆推（物理 mm 坐标）。每展开一层，静止层恒等映射，
   翻折层关于该层中线镜像；最终得到原纸上的全部孔位并按坐标去重。
 - 全部折痕展开后构成 (2^nv - 1) x (2^nh - 1) 的等分网格。
+- 反查打孔：给定原纸上的目标孔心，按折叠顺序正向逐层折回最终折叠面
+  （fold_point，与 unfold_points 互逆），得到归一化孔心；再用同一套展开
+  算法列出这一次打孔必然生成的全部孔位。目标孔心压纸张边界/折痕、或
+  反查孔心压折叠面边界时，返回具体原因且前端不允许确认。
 """
 
 from __future__ import annotations
@@ -48,22 +52,43 @@ EDGE_NAMES = {
 # 折叠模型
 # ---------------------------------------------------------------------------
 def folded_state(width, height, folds):
-    """按折叠顺序推进，返回 (当前面宽, 当前面高, 四条边身份, 垂直/水平次数)。"""
+    """按折叠顺序推进，返回 (当前面宽, 当前面高, 四条边身份, 垂直/水平次数)。
+
+    边身份跟踪：每折一次，折线成为新的折痕边；被翻折一侧的旧边与静止一侧
+    的旧边重合，两者身份合并（折痕优先——压折痕是更需要提示的情形）。
+    例如 vR（右半折向左）：中线成为右侧折痕边，原左右两边界在左缘重合。
+    """
     w, h = float(width), float(height)
     # 初始四条边都是原纸开口边界
     edges = {"x0": "cut", "x1": "cut", "y0": "cut", "y1": "cut"}
     nv = nh = 0
+
+    def merge(a, b):
+        return "fold" if "fold" in (a, b) else "cut"
+
     for f in folds:
         if f in ("vL", "vR"):
             w /= 2.0
             nv += 1
-            # 垂直对折：一条垂直边变折痕，另一条保持原身份；上下边不变
-            edges["x0" if f == "vR" else "x1"] = "fold"
+            if f == "vR":
+                # 垂直对折，右半折向左：中线 → 右缘折痕；原右边镜像到左缘
+                edges = {"x0": merge(edges["x0"], edges["x1"]), "x1": "fold",
+                         "y0": edges["y0"], "y1": edges["y1"]}
+            else:
+                # 垂直对折，左半折向右：中线 → 左缘折痕；原左边镜像到右缘
+                edges = {"x0": "fold", "x1": merge(edges["x0"], edges["x1"]),
+                         "y0": edges["y0"], "y1": edges["y1"]}
         else:
             h /= 2.0
             nh += 1
-            # 水平对折：一条水平边变折痕，另一条保持原身份；左右边不变
-            edges["y0" if f == "hB" else "y1"] = "fold"
+            if f == "hT":
+                # 水平对折，上半折向下：中线 → 上缘折痕；原上边镜像到下缘
+                edges = {"x0": edges["x0"], "x1": edges["x1"],
+                         "y0": merge(edges["y0"], edges["y1"]), "y1": "fold"}
+            else:
+                # 水平对折，下半折向上：中线 → 下缘折痕；原下边镜像到上缘
+                edges = {"x0": edges["x0"], "x1": edges["x1"],
+                         "y0": "fold", "y1": merge(edges["y0"], edges["y1"])}
     return w, h, edges, nv, nh
 
 
@@ -107,6 +132,34 @@ def unfold_points(points_mm, folds, width, height):
     return cur
 
 
+def fold_point(point_mm, folds, width, height):
+    """正向折回：把原纸上的点按折叠顺序映射到最终折叠面（物理 mm）。
+
+    与 unfold_points 互逆：每折一层，静止半面的点恒等，翻折半面的点关于
+    该层中线镜像，对应尺寸减半。unfold_points(fold_point(p)) 必包含 p。
+    """
+    x, y = float(point_mm[0]), float(point_mm[1])
+    cw, ch = float(width), float(height)
+    for f in folds:
+        if f in ("vL", "vR"):
+            line = cw / 2.0
+            if f == "vR":          # 右半折向左：静止左半，右半镜像
+                if x > line:
+                    x = cw - x
+            else:                  # vL 左半折向右：静止右半，左半镜像
+                x = x - line if x >= line else line - x
+            cw = line
+        else:
+            line = ch / 2.0
+            if f == "hT":          # 上半折向下：静止下半，上半镜像
+                if y > line:
+                    y = ch - y
+            else:                  # hB 下半折向上：静止上半，下半镜像
+                y = y - line if y >= line else line - y
+            ch = line
+    return x, y
+
+
 def dedupe_points(points, tol=1e-5):
     """按物理 mm 坐标去重（重合位置只保留一个）。"""
     out = []
@@ -117,17 +170,45 @@ def dedupe_points(points, tol=1e-5):
     return [{"x": round(x, 6), "y": round(y, 6)} for x, y in out]
 
 
-def check_point(px, py, w, h, radius, edges):
+def check_point(px, py, w, h, radius, edges,
+                label="孔位", hint="请调整孔位。"):
     """校验单个打孔点，返回中文错误信息；合法返回 None。"""
     r = radius + EDGE_TOL
     checks = (("x0", px), ("x1", w - px), ("y0", py), ("y1", h - py))
     for key, dist in checks:
         if dist < r:
             kind = edges[key]
-            return (f"孔位 ({px:.2f}, {py:.2f}) 距{EDGE_NAMES[kind][key]}仅 "
+            return (f"{label} ({px:.2f}, {py:.2f}) 距{EDGE_NAMES[kind][key]}仅 "
                     f"{max(dist, 0.0):.2f}mm，小于打孔半径 {radius:g}mm"
                     f"（{'折痕' if kind == 'fold' else '纸张边界'}，"
-                    f"孔必须完整落在纸面内侧），请调整孔位。")
+                    f"孔必须完整落在纸面内侧），{hint}")
+    return None
+
+
+def check_target_point(tx, ty, width, height, radius, nv, nh):
+    """校验反查目标孔心（原纸 mm 坐标）：不能压纸张边界或任何折痕。
+
+    返回中文原因；合法返回 None。
+    """
+    r = radius + EDGE_TOL
+    for key, dist in (("x0", tx), ("x1", width - tx),
+                      ("y0", ty), ("y1", height - ty)):
+        if dist < r:
+            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距{EDGE_NAMES['cut'][key]}仅 "
+                    f"{max(dist, 0.0):.2f}mm，小于打孔半径 {radius:g}mm"
+                    "（纸张边界，孔必须完整落在纸面内侧），请改选其他目标点。")
+    for k in range(1, 2 ** nv):
+        pos = width * k / 2 ** nv
+        if abs(tx - pos) < r:
+            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距垂直折痕 x={pos:.2f}mm 仅 "
+                    f"{abs(tx - pos):.2f}mm，小于打孔半径 {radius:g}mm"
+                    "（折痕，孔不能压在折痕上），请改选其他目标点。")
+    for k in range(1, 2 ** nh):
+        pos = height * k / 2 ** nh
+        if abs(ty - pos) < r:
+            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距水平折痕 y={pos:.2f}mm 仅 "
+                    f"{abs(ty - pos):.2f}mm，小于打孔半径 {radius:g}mm"
+                    "（折痕，孔不能压在折痕上），请改选其他目标点。")
     return None
 
 
@@ -245,8 +326,8 @@ def _num(obj, key, lo, hi, name):
     return val
 
 
-def compute(payload):
-    """核心计算。成功返回结果 dict，失败抛出 ValueError。"""
+def _validate_common(payload):
+    """校验纸张/半径/折法，返回 (width, height, radius, folds)。"""
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
@@ -260,6 +341,19 @@ def compute(payload):
     for f in folds:
         if f not in ALLOWED_FOLDS:
             raise ValueError("存在非法折叠方向，可选：vL / vR / hT / hB")
+    return width, height, radius, folds
+
+
+def _check_puncher_fits(w, h, radius):
+    if w < 2 * radius + 2 * EDGE_TOL or h < 2 * radius + 2 * EDGE_TOL:
+        raise ValueError(
+            f"折叠后纸面为 {w:g} × {h:g}mm，放不下直径 {2 * radius:g}mm 的打孔器，"
+            "请减少折叠次数或减小打孔半径。")
+
+
+def compute(payload):
+    """核心计算。成功返回结果 dict，失败抛出 ValueError。"""
+    width, height, radius, folds = _validate_common(payload)
 
     points = payload.get("points", [])
     if not isinstance(points, list) or len(points) > MAX_HOLES:
@@ -272,11 +366,7 @@ def compute(payload):
                          "y": _num(p, "y", 0.0, 1.0, "打孔点 y")})
 
     w, h, edges, nv, nh = folded_state(width, height, folds)
-
-    if w < 2 * radius + 2 * EDGE_TOL or h < 2 * radius + 2 * EDGE_TOL:
-        raise ValueError(
-            f"折叠后纸面为 {w:g} × {h:g}mm，放不下直径 {2 * radius:g}mm 的打孔器，"
-            "请减少折叠次数或减小打孔半径。")
+    _check_puncher_fits(w, h, radius)
 
     # 客户端坐标是归一化的；换算为折叠面 mm 坐标
     mm_pts = [{"x": p["x"] * w, "y": p["y"] * h} for p in norm_pts]
@@ -318,6 +408,54 @@ def compute(payload):
     }
 
 
+def reverse_lookup(payload):
+    """反查打孔：由原纸上的目标孔心折回最终折叠面，列出全部连带孔位。
+
+    几何不合法（目标点或反查孔心压边界/折痕）时在结果中给出具体原因，
+    由前端禁止确认；请求格式错误抛出 ValueError。
+    """
+    width, height, radius, folds = _validate_common(payload)
+
+    target = payload.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("缺少目标点 target（原纸归一化坐标 {x, y}）")
+    tnx = _num(target, "x", 0.0, 1.0, "目标点 x")
+    tny = _num(target, "y", 0.0, 1.0, "目标点 y")
+
+    w, h, edges, nv, nh = folded_state(width, height, folds)
+    _check_puncher_fits(w, h, radius)
+
+    tx, ty = tnx * width, tny * height
+    result = {
+        "ok": True,
+        "target": {"x": round(tx, 6), "y": round(ty, 6)},
+        "foldedPoint": None,        # 最终折叠面归一化孔心
+        "holes": [],                # 本次打孔必然生成的全部孔位（原纸 mm）
+        "holeCount": 0,
+        "expectedCount": 2 ** len(folds),
+        "error": None,
+    }
+
+    # 1) 目标孔心自身：不能压纸张边界或任何折痕
+    err = check_target_point(tx, ty, width, height, radius, nv, nh)
+    if err is None:
+        # 2) 按当前折叠顺序及折向逐层折回最终折叠面
+        fx, fy = fold_point((tx, ty), folds, width, height)
+        result["foldedPoint"] = {"x": round(fx / w, 6), "y": round(fy / h, 6)}
+        # 3) 反查孔心也不能压折叠面边界（等价于某个连带孔压边界/折痕）
+        err = check_point(fx, fy, w, h, radius, edges,
+                          label="反查孔心", hint="请改选其他目标点。")
+        if err is None:
+            # 4) 用现有展开算法列出这一次打孔必然生成的全部孔位
+            holes = dedupe_points(
+                unfold_points([{"x": fx, "y": fy}], folds, width, height))
+            result["holes"] = holes
+            result["holeCount"] = len(holes)
+    if err is not None:
+        result["error"] = err
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
@@ -337,6 +475,18 @@ def api_unfold():
         return _bad("请求不是合法 JSON")
     try:
         return jsonify(compute(payload))
+    except ValueError as exc:
+        return _bad(str(exc))
+
+
+@app.route("/api/reverse", methods=["POST"])
+def api_reverse():
+    """反查打孔：入参同 /api/unfold，但 points 换成单个 target（原纸归一化）。"""
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        return jsonify(reverse_lookup(payload))
     except ValueError as exc:
         return _bad(str(exc))
 
