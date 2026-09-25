@@ -99,6 +99,9 @@
   .legend .hole i {
     height:10px; width:10px; border-radius:50%; background:var(--red); border:none;
   }
+  .legend .preview i {
+    height:10px; width:10px; border-radius:50%; background:#f59e0b; border:none;
+  }
   .status {
     margin-top:10px; border-radius:6px; padding:8px 10px; font-size:12.5px;
     border:1px solid transparent; display:none;
@@ -119,7 +122,7 @@
 <body>
 <header>
   <h1>纸张对折打孔 · 展开预览</h1>
-  <p>设定纸张与折法 → 在最终折叠面上点击打孔 → 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。</p>
+  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。</p>
 </header>
 
 <div class="layout">
@@ -159,7 +162,8 @@
 
     <h2 style="margin-top:16px">打孔点 <small id="holeCountLabel">0 / {{ max_holes }}</small></h2>
     <p class="hint">在中间折叠面的<span style="color:var(--green)">绿色虚线安全框</span>内单击添加；
-      单击已有孔（2mm 内）可删除。</p>
+      单击已有孔（2mm 内）可删除。也可在右侧展开图开启「反查打孔」，
+      直接点击原纸上的目标孔心，由系统反推折叠面打孔位置。</p>
     <div class="toolbar">
       <button type="button" id="btnClearHoles" class="danger">清空全部孔</button>
     </div>
@@ -193,10 +197,19 @@
       <div class="legend">
         <span class="crease"><i></i>折痕</span>
         <span class="hole"><i></i>孔</span>
+        <span class="preview"><i></i>待确认反查孔位</span>
       </div>
       <div class="toolbar">
         <button type="button" id="btnDownload" class="primary" disabled>下载展开 SVG</button>
+        <button type="button" id="btnReverse"
+                title="在展开图上点击目标孔心，系统按当前折法反查折叠面打孔位置">反查打孔：关</button>
         <span class="hint" id="downloadHint"></span>
+      </div>
+      <p class="hint" id="reverseHint"></p>
+      <div class="toolbar" id="reverseBar" style="display:none">
+        <button type="button" id="btnConfirmReverse" class="primary">确认加入打孔点</button>
+        <button type="button" id="btnCancelReverse">取消</button>
+        <span class="hint" id="reverseInfo"></span>
       </div>
     </section>
   </div>
@@ -224,6 +237,12 @@
   var inflight = false;
   var dirty = false;
   var debounceTimer = null;
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  // 反查打孔：在展开图上点击原纸目标孔心，服务端折回折叠面并预览连带孔位
+  var reverseMode = false;
+  var pending = null;   // 待确认的反查结果（/api/reverse 返回）
+  var revSeq = 0;       // 反查请求序号；纸张/半径/折法一变即作废旧响应
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -241,6 +260,7 @@
       del.className = "danger"; del.type = "button"; del.textContent = "删除";
       del.addEventListener("click", function () {
         state.folds.splice(i, 1);
+        clearPending();
         renderFoldList();
         schedule(true);
       });
@@ -298,8 +318,7 @@
     var f = d.folded;
 
     // 折叠面
-    $("foldedSvgWrap").innerHTML = f.svg;
-    bindFoldedSvg(f);
+    renderFolded();
     $("foldedMeta").textContent = f.width + " × " + f.height + " mm";
     $("layerMeta").innerHTML =
       "当前共 <b>" + state.folds.length + "</b> 次折叠、" +
@@ -315,7 +334,7 @@
       $("downloadHint").textContent = "";
       setStatus("err", d.error);
     } else {
-      wrap.innerHTML = d.unfoldedSvg;
+      renderUnfolded();
       $("holeMeta").textContent = state.width + " × " + state.height + " mm";
       $("btnDownload").disabled = false;
       var merged = d.holeCount < d.expectedCount;
@@ -327,6 +346,27 @@
       setStatus("ok", msg);
     }
     $("holeCountLabel").textContent = state.points.length + " / " + MAX_HOLES;
+  }
+
+  // 折叠面重绘（含反查预览标记）
+  function renderFolded() {
+    if (!lastResult) return;
+    var f = lastResult.folded;
+    $("foldedSvgWrap").innerHTML = f.svg;
+    bindFoldedSvg(f);
+    renderPendingOnFolded(f);
+  }
+
+  // 展开图重绘（含反查预览高亮）
+  function renderUnfolded() {
+    var wrap = $("unfoldedSvgWrap");
+    if (!lastResult || lastResult.error) {
+      wrap.innerHTML = '<span class="placeholder">孔位不合法，暂不生成展开图</span>';
+      return;
+    }
+    wrap.innerHTML = lastResult.unfoldedSvg;
+    bindUnfoldedSvg();
+    renderPendingOverlay();
   }
 
   // ---------------- 折叠面点击 → 打孔坐标 ----------------
@@ -380,6 +420,144 @@
     return { x: x, y: y };
   }
 
+  // ---------------- 反查打孔：展开图点击 → 折回折叠面 → 预览/确认 ----------------
+  function bindUnfoldedSvg() {
+    var svg = $("unfoldedSvgWrap").querySelector("svg");
+    if (!svg) return;
+    svg.style.cursor = reverseMode ? "crosshair" : "";
+    svg.addEventListener("click", function (ev) {
+      if (!reverseMode) return;
+      var pt = toUnfoldedMm(ev, svg);
+      if (!pt) return;
+      if (pt.x < 0 || pt.x > state.width || pt.y < 0 || pt.y > state.height) {
+        setStatus("warn", "点击位置在原纸之外，请点在纸面内。");
+        return;
+      }
+      fetchReverse(pt);
+    });
+  }
+
+  function toUnfoldedMm(ev, svg) {
+    // 展开图 viewBox 即 "0 0 W H"（无内缩），y 轴与数学坐标相反
+    var vb = svg.viewBox.baseVal;
+    var rect = svg.getBoundingClientRect();
+    var sx = rect.width / vb.width, sy = rect.height / vb.height;
+    var s = Math.min(sx, sy);
+    var dispW = vb.width * s, dispH = vb.height * s;
+    var offX = (rect.width - dispW) / 2, offY = (rect.height - dispH) / 2;
+    var vx = (ev.clientX - rect.left - offX) / s;
+    var vy = (ev.clientY - rect.top - offY) / s;
+    var x = vx, y = vb.height - vy;
+    if (x < -1 || y < -1 || x > vb.width + 1 || y > vb.height + 1) return null;
+    return { x: x, y: y };
+  }
+
+  function fetchReverse(pt) {
+    var seq = ++revSeq;
+    fetch("/api/reverse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        width: state.width, height: state.height, radius: state.radius,
+        folds: state.folds,
+        target: { x: +pt.x.toFixed(6), y: +pt.y.toFixed(6) }
+      })
+    }).then(function (resp) {
+      return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });
+    }).then(function (r) {
+      if (seq !== revSeq) return;   // 参数已变或已有更新的点击，丢弃
+      if (!r.data || r.data.ok !== true) {
+        pending = null;
+        updateReverseBar();
+        renderUnfolded();
+        // 具体原因（触及哪条边界/折痕、实际距离）由服务端给出，不可确认
+        setStatus("err", (r.data && r.data.error) || "反查失败：服务器返回异常。");
+        return;
+      }
+      pending = r.data;
+      updateReverseBar();
+      renderUnfolded();
+      renderFolded();
+      setStatus("warn", "待确认：本次打孔将在原纸上生成 " + pending.holeCount +
+        " 个孔位（黄色高亮，蓝圈为目标孔）。确认后才加入现有打孔点。");
+    }).catch(function () {
+      if (seq !== revSeq) return;
+      setStatus("err", "网络错误：无法连接计算服务。");
+    });
+  }
+
+  // 展开图上高亮本次打孔必然生成的全部孔位，目标孔加蓝圈
+  function renderPendingOverlay() {
+    if (!pending) return;
+    var svg = $("unfoldedSvgWrap").querySelector("svg");
+    if (!svg) return;
+    var H = svg.viewBox.baseVal.height;
+    var g = document.createElementNS(SVG_NS, "g");
+    g.setAttribute("id", "reversePreview");
+    pending.holes.forEach(function (hp) {
+      var c = document.createElementNS(SVG_NS, "circle");
+      c.setAttribute("cx", hp.x);
+      c.setAttribute("cy", H - hp.y);
+      c.setAttribute("r", state.radius);
+      c.setAttribute("fill", "#f59e0b");
+      c.setAttribute("fill-opacity", "0.55");
+      c.setAttribute("stroke", "#b45309");
+      c.setAttribute("stroke-width", "0.4");
+      c.setAttribute("stroke-dasharray", "1.2 1.2");
+      g.appendChild(c);
+    });
+    var t = document.createElementNS(SVG_NS, "circle");
+    t.setAttribute("cx", pending.target.x);
+    t.setAttribute("cy", H - pending.target.y);
+    t.setAttribute("r", state.radius + 1.2);
+    t.setAttribute("fill", "none");
+    t.setAttribute("stroke", "#2563eb");
+    t.setAttribute("stroke-width", "0.5");
+    g.appendChild(t);
+    svg.appendChild(g);
+  }
+
+  // 折叠面上标出反查得到的打孔位置（待确认）
+  function renderPendingOnFolded(f) {
+    if (!pending) return;
+    var svg = $("foldedSvgWrap").querySelector("svg");
+    if (!svg) return;
+    var c = document.createElementNS(SVG_NS, "circle");
+    c.setAttribute("cx", f.pad + pending.center.x * f.width);
+    c.setAttribute("cy", f.pad + f.height - pending.center.y * f.height);
+    c.setAttribute("r", state.radius);
+    c.setAttribute("fill", "#f59e0b");
+    c.setAttribute("fill-opacity", "0.5");
+    c.setAttribute("stroke", "#b45309");
+    c.setAttribute("stroke-width", "0.3");
+    c.setAttribute("stroke-dasharray", "1 1");
+    svg.appendChild(c);
+  }
+
+  function updateReverseBar() {
+    var bar = $("reverseBar");
+    if (!pending) {
+      bar.style.display = "none";
+      $("reverseInfo").textContent = "";
+      return;
+    }
+    bar.style.display = "flex";
+    $("reverseInfo").textContent =
+      "目标 (" + pending.target.x.toFixed(1) + ", " + pending.target.y.toFixed(1) +
+      ") mm → 折叠面孔心 (" + pending.center.x.toFixed(3) + ", " +
+      pending.center.y.toFixed(3) + ")，本次打孔共 " + pending.holeCount + " 个孔位";
+  }
+
+  // 纸张、半径或折法变化时调用：丢弃待确认预览并使进行中的响应失效
+  function clearPending() {
+    revSeq++;
+    if (!pending) return;
+    pending = null;
+    updateReverseBar();
+    renderUnfolded();
+    renderFolded();
+  }
+
   // ---------------- 控件绑定 ----------------
   function readInputs() {
     var w = parseFloat($("inW").value), h = parseFloat($("inH").value),
@@ -394,7 +572,14 @@
 
   ["inW", "inH", "inR"].forEach(function (id) {
     $(id).addEventListener("input", function () {
-      if (readInputs()) schedule(false);
+      var pw = state.width, ph = state.height, pr = state.radius;
+      if (readInputs()) {
+        // 纸张或半径一变，待确认的反查预览即失效
+        if (pw !== state.width || ph !== state.height || pr !== state.radius) {
+          clearPending();
+        }
+        schedule(false);
+      }
     });
   });
 
@@ -402,18 +587,23 @@
     b.addEventListener("click", function () {
       if (state.folds.length >= MAX_FOLDS) return;
       state.folds.push(b.getAttribute("data-add"));
+      clearPending();
       renderFoldList();
       schedule(true);
     });
   });
 
   $("btnUndo").addEventListener("click", function () {
+    if (!state.folds.length) return;
     state.folds.pop();
+    clearPending();
     renderFoldList();
     schedule(true);
   });
   $("btnClearFolds").addEventListener("click", function () {
+    if (!state.folds.length) return;
     state.folds = [];
+    clearPending();
     renderFoldList();
     schedule(true);
   });
@@ -425,12 +615,49 @@
   document.querySelectorAll("[data-preset]").forEach(function (b) {
     b.addEventListener("click", function () {
       var p = b.getAttribute("data-preset");
+      var pw = state.width, ph = state.height;
       if (p === "a4") { state.width = 210; state.height = 297; }
       if (p === "a4l") { state.width = 297; state.height = 210; }
       if (p === "square") { state.width = 200; state.height = 200; }
+      if (pw !== state.width || ph !== state.height) clearPending();
       $("inW").value = state.width; $("inH").value = state.height;
       schedule(true);
     });
+  });
+
+  // ---------------- 反查打孔：开关 / 确认 / 取消 ----------------
+  $("btnReverse").addEventListener("click", function () {
+    reverseMode = !reverseMode;
+    this.classList.toggle("primary", reverseMode);
+    this.textContent = reverseMode ? "反查打孔：开" : "反查打孔：关";
+    $("reverseHint").textContent = reverseMode
+      ? "反查模式：在展开图上点击目标孔心，系统按当前折法逐层折回折叠面，" +
+        "并高亮本次打孔必然生成的全部孔位；确认后才加入现有打孔点。"
+      : "";
+    clearPending();
+    renderUnfolded();
+  });
+
+  $("btnConfirmReverse").addEventListener("click", function () {
+    if (!pending) return;
+    if (state.points.length >= MAX_HOLES) {
+      setStatus("warn", "打孔点数量已达上限 " + MAX_HOLES +
+        " 个，请先删除部分打孔点再确认。");
+      return;
+    }
+    // 与在折叠面直接点击完全等价：加入归一化孔心，走现有展开/下载流程
+    state.points.push({
+      x: +pending.center.x.toFixed(6),
+      y: +pending.center.y.toFixed(6)
+    });
+    pending = null;
+    updateReverseBar();
+    schedule(true);
+  });
+
+  $("btnCancelReverse").addEventListener("click", function () {
+    clearPending();
+    setStatus("", "");
   });
 
   $("btnDownload").addEventListener("click", function () {
